@@ -28,6 +28,7 @@ const DAILY_CONNECTED_MINUTES = 60;
 const DAILY_MISSION_30_XP = 10;
 const DAILY_MISSION_60_XP = 25;
 const DAILY_STREAM_15_XP = 15;
+const DAILY_SOCIAL_30_XP = 15;
 
 client.once("clientReady", async () => {
     console.log(`Bot conectado como ${client.user.tag}`);
@@ -96,6 +97,7 @@ function ensureVoiceUserExists(userId) {
                 user_id,
                 total_voice_time_ms,
                 total_stream_time_ms,
+                total_social_voice_time_ms,
                 voice_sessions_count,
                 first_voice_join_at,
                 last_voice_join_at,
@@ -104,7 +106,7 @@ function ensureVoiceUserExists(userId) {
                 voice_level,
                 days_connected,
                 xp_seeded
-            ) VALUES (?, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0, 1)
+            ) VALUES (?, 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0, 1)
         `).run(userId);
     }
 }
@@ -162,11 +164,13 @@ function ensureDailyRow(userId, dateKey) {
                 stat_date,
                 voice_minutes,
                 stream_minutes,
+                social_minutes,
                 day_counted,
                 mission_30_done,
                 mission_60_done,
-                mission_stream_15_done
-            ) VALUES (?, ?, 0, 0, 0, 0, 0, 0)
+                mission_stream_15_done,
+                mission_social_30_done
+            ) VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
         `).run(userId, dateKey);
     }
 }
@@ -258,6 +262,22 @@ async function announceLevelUp(guild, userId, oldLevel, newLevel) {
     );
 }
 
+function getChannelHumanCount(member) {
+    const channel = member.voice?.channel;
+    if (!channel) return 0;
+
+    return channel.members.filter(m => !m.user.bot).size;
+}
+
+function getMinuteXp(member) {
+    const count = getChannelHumanCount(member);
+
+    if (count <= 1) return 0;
+    if (count === 2) return 1;
+    if (count <= 4) return 2;
+    return 3;
+}
+
 function openVoiceSession(member, channelId) {
     const now = new Date().toISOString();
     const userId = member.id;
@@ -277,9 +297,10 @@ function openVoiceSession(member, channelId) {
             duration_ms,
             tracked_voice_ms,
             tracked_stream_ms,
+            tracked_social_voice_ms,
             xp_earned,
             last_tick_at
-        ) VALUES (?, ?, ?, ?, NULL, 0, 0, 0, 0, ?)
+        ) VALUES (?, ?, ?, ?, NULL, 0, 0, 0, 0, 0, ?)
     `).run(userId, member.guild.id, channelId, now, now);
 
     const voiceUser = db.prepare(`
@@ -329,6 +350,7 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
     let bonusXp = 0;
     let daysGained = 0;
     let streamMinutesAwarded = 0;
+    let socialMinutesAwarded = 0;
 
     for (let i = 1; i <= fullMinutes; i++) {
         const minuteMark = new Date(lastTick.getTime() + (i * 60000));
@@ -341,17 +363,30 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
             WHERE user_id = ? AND stat_date = ?
         `).get(member.id, dateKey);
 
+        const minuteXp = getMinuteXp(member);
         const isStreaming = Boolean(member.voice.selfStream);
+        const isSocialMinute = minuteXp > 0;
+
         const nextVoiceMinutes = daily.voice_minutes + 1;
         const nextStreamMinutes = daily.stream_minutes + (isStreaming ? 1 : 0);
+        const nextSocialMinutes = daily.social_minutes + (isSocialMinute ? 1 : 0);
 
         let mission30Done = daily.mission_30_done;
         let mission60Done = daily.mission_60_done;
         let missionStream15Done = daily.mission_stream_15_done;
+        let missionSocial30Done = daily.mission_social_30_done;
         let dayCounted = daily.day_counted;
 
-        baseXp += 1;
-        if (isStreaming) streamMinutesAwarded += 1;
+        baseXp += minuteXp;
+
+        if (isStreaming) {
+            streamMinutesAwarded += 1;
+            baseXp += 1;
+        }
+
+        if (isSocialMinute) {
+            socialMinutesAwarded += 1;
+        }
 
         if (!mission30Done && nextVoiceMinutes >= 30) {
             bonusXp += DAILY_MISSION_30_XP;
@@ -373,23 +408,32 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
             missionStream15Done = 1;
         }
 
+        if (!missionSocial30Done && nextSocialMinutes >= 30) {
+            bonusXp += DAILY_SOCIAL_30_XP;
+            missionSocial30Done = 1;
+        }
+
         db.prepare(`
             UPDATE voice_daily_stats
             SET
                 voice_minutes = ?,
                 stream_minutes = ?,
+                social_minutes = ?,
                 day_counted = ?,
                 mission_30_done = ?,
                 mission_60_done = ?,
-                mission_stream_15_done = ?
+                mission_stream_15_done = ?,
+                mission_social_30_done = ?
             WHERE user_id = ? AND stat_date = ?
         `).run(
             nextVoiceMinutes,
             nextStreamMinutes,
+            nextSocialMinutes,
             dayCounted,
             mission30Done,
             mission60Done,
             missionStream15Done,
+            missionSocial30Done,
             member.id,
             dateKey
         );
@@ -397,6 +441,7 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
 
     const awardVoiceMs = fullMinutes * 60000;
     const awardStreamMs = streamMinutesAwarded * 60000;
+    const awardSocialMs = socialMinutesAwarded * 60000;
     const totalXpGain = baseXp + bonusXp;
     const newLastTick = new Date(lastTick.getTime() + (fullMinutes * 60000)).toISOString();
 
@@ -415,12 +460,14 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
         SET
             tracked_voice_ms = tracked_voice_ms + ?,
             tracked_stream_ms = tracked_stream_ms + ?,
+            tracked_social_voice_ms = tracked_social_voice_ms + ?,
             xp_earned = xp_earned + ?,
             last_tick_at = ?
         WHERE id = ?
     `).run(
         awardVoiceMs,
         awardStreamMs,
+        awardSocialMs,
         totalXpGain,
         newLastTick,
         session.id
@@ -431,6 +478,7 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
         SET
             total_voice_time_ms = total_voice_time_ms + ?,
             total_stream_time_ms = total_stream_time_ms + ?,
+            total_social_voice_time_ms = total_social_voice_time_ms + ?,
             voice_xp = ?,
             voice_level = ?,
             days_connected = days_connected + ?
@@ -438,6 +486,7 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
     `).run(
         awardVoiceMs,
         awardStreamMs,
+        awardSocialMs,
         newXp,
         newLevel,
         daysGained,
@@ -781,6 +830,9 @@ client.on("interactionCreate", async (interaction) => {
                 `⏳ **Tiempo total en voz**`,
                 `${formatDuration(row.total_voice_time_ms)}`,
                 ``,
+                `🤝 **Tiempo acompañado**`,
+                `${formatDuration(row.total_social_voice_time_ms)}`,
+                ``,
                 `🖥️ **Tiempo compartiendo pantalla**`,
                 `${formatDuration(row.total_stream_time_ms)}`,
                 ``,
@@ -857,7 +909,7 @@ client.on("interactionCreate", async (interaction) => {
                 .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
                 .setDescription(description)
                 .setColor(0xf1c40f)
-                .setFooter({ text: "1 XP por cada minuto completo en voz" })
+                .setFooter({ text: "XP social: solo cuenta bien si no estás solo en voz" })
                 .setTimestamp();
 
             return interaction.editReply({ embeds: [embed] });

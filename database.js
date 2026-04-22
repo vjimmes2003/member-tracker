@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS voice_users (
     user_id TEXT PRIMARY KEY,
     total_voice_time_ms INTEGER DEFAULT 0,
     total_stream_time_ms INTEGER DEFAULT 0,
+    total_social_voice_time_ms INTEGER DEFAULT 0,
     voice_sessions_count INTEGER DEFAULT 0,
     first_voice_join_at TEXT,
     last_voice_join_at TEXT,
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS voice_sessions (
     duration_ms INTEGER DEFAULT 0,
     tracked_voice_ms INTEGER DEFAULT 0,
     tracked_stream_ms INTEGER DEFAULT 0,
+    tracked_social_voice_ms INTEGER DEFAULT 0,
     xp_earned INTEGER DEFAULT 0,
     last_tick_at TEXT
 )
@@ -86,15 +88,18 @@ CREATE TABLE IF NOT EXISTS voice_daily_stats (
     stat_date TEXT NOT NULL,
     voice_minutes INTEGER DEFAULT 0,
     stream_minutes INTEGER DEFAULT 0,
+    social_minutes INTEGER DEFAULT 0,
     day_counted INTEGER DEFAULT 0,
     mission_30_done INTEGER DEFAULT 0,
     mission_60_done INTEGER DEFAULT 0,
     mission_stream_15_done INTEGER DEFAULT 0,
+    mission_social_30_done INTEGER DEFAULT 0,
     PRIMARY KEY (user_id, stat_date)
 )
 `).run();
 
 ensureColumn("voice_users", "total_stream_time_ms", "INTEGER DEFAULT 0");
+ensureColumn("voice_users", "total_social_voice_time_ms", "INTEGER DEFAULT 0");
 ensureColumn("voice_users", "voice_xp", "INTEGER DEFAULT 0");
 ensureColumn("voice_users", "voice_level", "INTEGER DEFAULT 0");
 ensureColumn("voice_users", "days_connected", "INTEGER DEFAULT 0");
@@ -102,7 +107,11 @@ ensureColumn("voice_users", "xp_seeded", "INTEGER DEFAULT 0");
 
 ensureColumn("voice_sessions", "tracked_voice_ms", "INTEGER DEFAULT 0");
 ensureColumn("voice_sessions", "tracked_stream_ms", "INTEGER DEFAULT 0");
+ensureColumn("voice_sessions", "tracked_social_voice_ms", "INTEGER DEFAULT 0");
 ensureColumn("voice_sessions", "xp_earned", "INTEGER DEFAULT 0");
 ensureColumn("voice_sessions", "last_tick_at", "TEXT");
+
+ensureColumn("voice_daily_stats", "social_minutes", "INTEGER DEFAULT 0");
+ensureColumn("voice_daily_stats", "mission_social_30_done", "INTEGER DEFAULT 0");
 
 module.exports = db;
