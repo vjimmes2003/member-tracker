@@ -12,7 +12,7 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("voz-perfil")
-        .setDescription("Muestra estadísticas de voz de un usuario")
+        .setDescription("Muestra la tarjeta de voz de un usuario")
         .addUserOption(option =>
             option
                 .setName("usuario")
@@ -22,7 +22,7 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName("voz-nivel")
-        .setDescription("Muestra el nivel de voz de un usuario")
+        .setDescription("Muestra el progreso de nivel de voz de un usuario")
         .addUserOption(option =>
             option
                 .setName("usuario")

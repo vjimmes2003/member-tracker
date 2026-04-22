@@ -25,6 +25,21 @@ function formatDuration(ms) {
     return parts.join(", ");
 }
 
+function formatShortDuration(ms) {
+    if (ms === null || ms === undefined || isNaN(ms)) return "0m";
+
+    const totalSeconds = Math.floor(ms / 1000);
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    const totalHours = Math.floor(totalMinutes / 60);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    const minutes = totalMinutes % 60;
+
+    if (days > 0) return `${days}d ${hours}h`;
+    if (hours > 0) return `${hours}h ${minutes}m`;
+    return `${minutes}m`;
+}
+
 function formatDate(date) {
     if (!date) return "Desconocido";
 
@@ -81,7 +96,7 @@ function getXpProgress(xp) {
     };
 }
 
-function makeProgressBar(percent, size = 10) {
+function makeProgressBar(percent, size = 12) {
     const safe = Math.max(0, Math.min(100, percent));
     const filled = Math.round((safe / 100) * size);
     const empty = size - filled;
@@ -102,6 +117,7 @@ function formatHours(hours) {
 
 module.exports = {
     formatDuration,
+    formatShortDuration,
     formatDate,
     truncate,
     getMadridDateKey,
