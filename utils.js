@@ -39,8 +39,75 @@ function truncate(text, max = 1024) {
     return text.slice(0, max - 3) + "...";
 }
 
+function getMadridDateKey(date = new Date()) {
+    return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Europe/Madrid",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit"
+    }).format(date);
+}
+
+function xpForLevel(level) {
+    if (level <= 0) return 0;
+    return 30 * level * (level + 1);
+}
+
+function levelFromXp(xp) {
+    let level = 0;
+    while (xp >= xpForLevel(level + 1)) {
+        level++;
+    }
+    return level;
+}
+
+function getXpProgress(xp) {
+    const level = levelFromXp(xp);
+    const currentFloor = xpForLevel(level);
+    const nextFloor = xpForLevel(level + 1);
+    const progress = xp - currentFloor;
+    const needed = nextFloor - currentFloor;
+    const remaining = nextFloor - xp;
+    const percent = needed <= 0 ? 100 : Math.max(0, Math.min(100, Math.floor((progress / needed) * 100)));
+
+    return {
+        level,
+        currentFloor,
+        nextFloor,
+        progress,
+        needed,
+        remaining,
+        percent
+    };
+}
+
+function makeProgressBar(percent, size = 10) {
+    const safe = Math.max(0, Math.min(100, percent));
+    const filled = Math.round((safe / 100) * size);
+    const empty = size - filled;
+    return "🟩".repeat(filled) + "⬜".repeat(empty);
+}
+
+function formatHours(hours) {
+    if (hours === null || hours === undefined || isNaN(hours)) {
+        return "Desconocido";
+    }
+
+    if (hours < 1) {
+        return `${Math.round(hours * 60)} min`;
+    }
+
+    return `${hours.toFixed(2)} h`;
+}
+
 module.exports = {
     formatDuration,
     formatDate,
-    truncate
+    truncate,
+    getMadridDateKey,
+    xpForLevel,
+    levelFromXp,
+    getXpProgress,
+    makeProgressBar,
+    formatHours
 };
