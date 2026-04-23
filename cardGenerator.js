@@ -1,9 +1,14 @@
-const { createCanvas, loadImage } = require("canvas")
+const { createCanvas, loadImage, registerFont } = require("canvas");
+registerFont("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf", {
+    family: "NotoEmoji"
+});
 
 async function generateVoiceCard(user, stats, progress, avatarUrl) {
 
 const canvas = createCanvas(900, 280)
 const ctx = canvas.getContext("2d")
+
+
 
 // fondo
 ctx.fillStyle = "#2b2d31"
@@ -39,12 +44,11 @@ barHeight
 
 // texto XP
 ctx.fillStyle="#fff"
-ctx.font="16px sans-serif"
+ctx.font = "22px NotoEmoji";
 ctx.fillText(`${progress.current} / ${progress.next} XP`,240,200)
 
 // estadísticas derecha
-ctx.font="18px sans-serif"
-
+ctx.font="22px NotoEmoji";
 ctx.fillText(
 `⏱ ${Math.floor(stats.total_voice_time_ms/3600000)}h voz`,
 700,
