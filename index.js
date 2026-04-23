@@ -3,6 +3,8 @@ require("dotenv").config();
 const { Client, GatewayIntentBits, EmbedBuilder, ChannelType } = require("discord.js");
 const db = require("./database");
 const config = require("./config");
+const { checkAchievements } = require("./achievementSystem")
+
 const {
     formatDuration,
     formatShortDuration,
@@ -446,6 +448,8 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
     const newXp = (voiceUserBefore.voice_xp || 0) + totalXpGain;
     const oldLevel = voiceUserBefore.voice_level || 0;
     const newLevel = levelFromXp(newXp);
+
+    await checkAchievements(member, client)
 
     db.prepare(`
         UPDATE voice_sessions

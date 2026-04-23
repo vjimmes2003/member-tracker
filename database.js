@@ -98,6 +98,15 @@ CREATE TABLE IF NOT EXISTS voice_daily_stats (
 )
 `).run();
 
+db.prepare(`
+CREATE TABLE IF NOT EXISTS voice_achievements (
+    user_id TEXT,
+    achievement_id TEXT,
+    unlocked_at TEXT,
+    PRIMARY KEY (user_id, achievement_id)
+)
+`).run();
+
 ensureColumn("voice_users", "total_stream_time_ms", "INTEGER DEFAULT 0");
 ensureColumn("voice_users", "total_social_voice_time_ms", "INTEGER DEFAULT 0");
 ensureColumn("voice_users", "voice_xp", "INTEGER DEFAULT 0");
