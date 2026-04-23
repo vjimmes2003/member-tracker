@@ -25,6 +25,7 @@ const {
 
 const { checkAchievements } = require("./achievementSystem");
 const { generateVoiceCard } = require("./cardGenerator");
+const { updatePanel, ensurePanelMessages } = require("./panelSystem");
 
 const client = new Client({
     intents: [
@@ -55,6 +56,9 @@ client.once("clientReady", async () => {
         await syncAllVoiceRoles(guild);
     }
 
+    await ensurePanelMessages(client);
+    await updatePanel(client);
+
     setInterval(async () => {
         try {
             for (const [, guild] of client.guilds.cache) {
@@ -64,6 +68,14 @@ client.once("clientReady", async () => {
             console.error("Error en el tick de voz:", error);
         }
     }, VOICE_TICK_MS);
+
+    setInterval(async () => {
+        try {
+            await updatePanel(client);
+        } catch (error) {
+            console.error("Error actualizando panel:", error);
+        }
+    }, config.panelUpdateMinutes * 60 * 1000);
 });
 
 client.on("error", (error) => {

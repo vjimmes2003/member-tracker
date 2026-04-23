@@ -5,6 +5,8 @@ module.exports = {
     despedidasChannel: process.env.DESPEDIDAS_CHANNEL,
     avisosChannel: process.env.AVISOS_CHANNEL,
     voiceAnnounceChannel: process.env.VOICE_ANNOUNCE_CHANNEL || null,
+    panelChannel: process.env.PANEL_CHANNEL || null,
+    panelUpdateMinutes: Number(process.env.PANEL_UPDATE_MINUTES || 5),
 
     voiceLevelRoles: [
         { level: 1, roleId: process.env.VOICE_ROLE_LVL_1 || null, name: "🎧 Recluta de Voz" },
@@ -16,6 +18,6 @@ module.exports = {
         { level: 50, roleId: process.env.VOICE_ROLE_LVL_50 || null, name: "👑 Señor del Canal" },
         { level: 65, roleId: process.env.VOICE_ROLE_LVL_65 || null, name: "💠 Maestro de Resonancia" },
         { level: 80, roleId: process.env.VOICE_ROLE_LVL_80 || null, name: "🌌 Titán de la Voz" },
-        { level: 100, roleId: process.env.VOICE_ROLE_LVL_100 || null, name: "🚀 Leyenda del Servidor" }
+        { level: 100, roleId: process.env.VOICE_ROLE_LVL_100 || null, name: "🚀 Leyenda del Micro" }
     ].filter(entry => entry.roleId)
 };
