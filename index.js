@@ -1,9 +1,15 @@
 require("dotenv").config();
 
-const { Client, GatewayIntentBits, EmbedBuilder, ChannelType } = require("discord.js");
+const {
+    Client,
+    GatewayIntentBits,
+    EmbedBuilder,
+    ChannelType,
+    AttachmentBuilder
+} = require("discord.js");
+
 const db = require("./database");
 const config = require("./config");
-const { checkAchievements } = require("./achievementSystem")
 
 const {
     formatDuration,
@@ -16,6 +22,9 @@ const {
     makeProgressBar,
     formatHours
 } = require("./utils");
+
+const { checkAchievements } = require("./achievementSystem");
+const { generateVoiceCard } = require("./cardGenerator");
 
 const client = new Client({
     intents: [
@@ -264,6 +273,10 @@ function getChannelHumanCount(member) {
 }
 
 function getMinuteXp(member) {
+    if (member.voice?.selfMute && member.voice?.selfDeaf) {
+        return 0;
+    }
+
     const count = getChannelHumanCount(member);
 
     if (count <= 1) return 0;
@@ -449,8 +462,6 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
     const oldLevel = voiceUserBefore.voice_level || 0;
     const newLevel = levelFromXp(newXp);
 
-    await checkAchievements(member, client)
-
     db.prepare(`
         UPDATE voice_sessions
         SET
@@ -489,9 +500,27 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
         member.id
     );
 
-    if (newLevel > oldLevel) {
-        await syncVoiceLevelRole(member.guild, member.id, newLevel);
-        await announceLevelUp(member.guild, member.id, oldLevel, newLevel);
+    await checkAchievements(member, client);
+
+    const finalUser = db.prepare(`
+        SELECT *
+        FROM voice_users
+        WHERE user_id = ?
+    `).get(member.id);
+
+    const finalLevel = levelFromXp(finalUser.voice_xp || 0);
+
+    if (finalLevel !== finalUser.voice_level) {
+        db.prepare(`
+            UPDATE voice_users
+            SET voice_level = ?
+            WHERE user_id = ?
+        `).run(finalLevel, member.id);
+    }
+
+    if (finalLevel > oldLevel) {
+        await syncVoiceLevelRole(member.guild, member.id, finalLevel);
+        await announceLevelUp(member.guild, member.id, oldLevel, finalLevel);
     }
 }
 
@@ -791,6 +820,75 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply({ embeds: [embed] });
         }
 
+        if (command === "voz-top-xp") {
+            const rows = db.prepare(`
+                SELECT user_id, voice_xp, voice_level
+                FROM voice_users
+                ORDER BY voice_xp DESC
+                LIMIT 10
+            `).all();
+
+            const description = rows.length
+                ? rows.map((row, index) =>
+                    `**${index + 1}.** <@${row.user_id}> — ${row.voice_xp} XP · Nivel ${row.voice_level}`
+                ).join("\n")
+                : "No hay XP de voz registrada todavía.";
+
+            const embed = new EmbedBuilder()
+                .setTitle("⭐ Top XP de voz")
+                .setDescription(description)
+                .setColor(0xf1c40f)
+                .setTimestamp();
+
+            return interaction.editReply({ embeds: [embed] });
+        }
+
+        if (command === "voz-top-social") {
+            const rows = db.prepare(`
+                SELECT user_id, total_social_voice_time_ms
+                FROM voice_users
+                ORDER BY total_social_voice_time_ms DESC
+                LIMIT 10
+            `).all();
+
+            const description = rows.length
+                ? rows.map((row, index) =>
+                    `**${index + 1}.** <@${row.user_id}> — ${formatShortDuration(row.total_social_voice_time_ms)}`
+                ).join("\n")
+                : "No hay tiempo social registrado todavía.";
+
+            const embed = new EmbedBuilder()
+                .setTitle("🤝 Top social")
+                .setDescription(description)
+                .setColor(0x2ecc71)
+                .setTimestamp();
+
+            return interaction.editReply({ embeds: [embed] });
+        }
+
+        if (command === "voz-top-stream") {
+            const rows = db.prepare(`
+                SELECT user_id, total_stream_time_ms
+                FROM voice_users
+                ORDER BY total_stream_time_ms DESC
+                LIMIT 10
+            `).all();
+
+            const description = rows.length
+                ? rows.map((row, index) =>
+                    `**${index + 1}.** <@${row.user_id}> — ${formatShortDuration(row.total_stream_time_ms)}`
+                ).join("\n")
+                : "No hay tiempo de stream registrado todavía.";
+
+            const embed = new EmbedBuilder()
+                .setTitle("🖥️ Top streamers")
+                .setDescription(description)
+                .setColor(0x3498db)
+                .setTimestamp();
+
+            return interaction.editReply({ embeds: [embed] });
+        }
+
         if (command === "voz-perfil") {
             const targetUser = interaction.options.getUser("usuario") || interaction.user;
 
@@ -814,52 +912,45 @@ client.on("interactionCreate", async (interaction) => {
             const currentRole = getTargetVoiceRole(row.voice_level);
             const currentRoleText = currentRole ? `<@&${currentRole.roleId}>` : "Sin rango de voz";
 
-            const description = [
-                `**<@${targetUser.id}>**`,
-                `Actividad y progreso actual en voz`,
-                ``,
-                `⭐ **Nivel:** ${row.voice_level}`,
-                `✨ **XP:** ${row.voice_xp}`,
-                `🏅 **Rango actual:** ${currentRoleText}`,
-                `📅 **Días conectados:** ${row.days_connected}`,
-                ``,
-                `⏳ **Tiempo total en voz**`,
-                `${formatDuration(row.total_voice_time_ms)}`,
-                ``,
-                `🤝 **Tiempo acompañado**`,
-                `${formatDuration(row.total_social_voice_time_ms)}`,
-                ``,
-                `🖥️ **Tiempo compartiendo pantalla**`,
-                `${formatDuration(row.total_stream_time_ms)}`,
-                ``,
-                `🎙️ **Sesiones completadas**`,
-                `${row.voice_sessions_count}`,
-                ``,
-                `📊 **Media por sesión**`,
-                `${formatDuration(avgSessionMs)}`,
-                ``,
-                `📈 **Progreso al siguiente nivel**`,
-                `${makeProgressBar(progress.percent)} ${progress.percent}%`,
-                ``,
-                `🚀 **Siguiente nivel**`,
-                `Nivel ${row.voice_level + 1} · ${progress.remaining} XP restantes`,
-                ``,
-                `🎙️ **Primera vez en voz**`,
-                `${formatDate(row.first_voice_join_at)}`,
-                ``,
-                `🔴 **Última salida**`,
-                `${formatDate(row.last_voice_leave_at)}`
-            ].join("\n");
+            const cardProgress = {
+                ...progress,
+                current: row.voice_xp,
+                next: progress.nextFloor
+            };
+
+            const buffer = await generateVoiceCard(
+                targetUser,
+                row,
+                cardProgress,
+                targetUser.displayAvatarURL({ extension: "png", forceStatic: true, size: 256 })
+            );
+
+            const attachment = new AttachmentBuilder(buffer, { name: "voice-card.png" });
 
             const embed = new EmbedBuilder()
-                .setTitle("🎧 Tarjeta de voz")
-                .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-                .setDescription(description)
+                .setTitle("🎧 Perfil de voz")
+                .setDescription(
+                    [
+                        `**<@${targetUser.id}>**`,
+                        `⭐ Nivel **${row.voice_level}** · ✨ **${row.voice_xp} XP**`,
+                        `🏅 Rango actual: ${currentRoleText}`,
+                        `📅 Días conectados: **${row.days_connected}**`,
+                        `⏳ Voz: **${formatDuration(row.total_voice_time_ms)}**`,
+                        `🤝 Social: **${formatDuration(row.total_social_voice_time_ms)}**`,
+                        `🖥️ Stream: **${formatDuration(row.total_stream_time_ms)}**`,
+                        `📊 Media por sesión: **${formatDuration(avgSessionMs)}**`,
+                        `🚀 Siguiente nivel: **${progress.remaining} XP restantes**`
+                    ].join("\n")
+                )
                 .setColor(0xfee75c)
+                .setImage("attachment://voice-card.png")
                 .setFooter({ text: "Sistema de actividad en voz" })
                 .setTimestamp();
 
-            return interaction.editReply({ embeds: [embed] });
+            return interaction.editReply({
+                embeds: [embed],
+                files: [attachment]
+            });
         }
 
         if (command === "voz-nivel") {
@@ -923,7 +1014,7 @@ client.on("interactionCreate", async (interaction) => {
             } else {
                 await interaction.reply({
                     content: "Ha ocurrido un error ejecutando el comando.",
-                    ephemeral: true
+                    flags: 64
                 });
             }
         } catch (replyError) {
