@@ -85,30 +85,22 @@ function saveName(userId, type, value) {
 }
 
 function ensureVoiceUserExists(userId) {
-    const existing = db.prepare(`
-        SELECT *
-        FROM voice_users
-        WHERE user_id = ?
-    `).get(userId);
-
-    if (!existing) {
-        db.prepare(`
-            INSERT INTO voice_users (
-                user_id,
-                total_voice_time_ms,
-                total_stream_time_ms,
-                total_social_voice_time_ms,
-                voice_sessions_count,
-                first_voice_join_at,
-                last_voice_join_at,
-                last_voice_leave_at,
-                voice_xp,
-                voice_level,
-                days_connected,
-                xp_seeded
-            ) VALUES (?, 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0, 1)
-        `).run(userId);
-    }
+    db.prepare(`
+        INSERT OR IGNORE INTO voice_users (
+            user_id,
+            total_voice_time_ms,
+            total_stream_time_ms,
+            total_social_voice_time_ms,
+            voice_sessions_count,
+            first_voice_join_at,
+            last_voice_join_at,
+            last_voice_leave_at,
+            voice_xp,
+            voice_level,
+            days_connected,
+            xp_seeded
+        ) VALUES (?, 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0, 1)
+    `).run(userId);
 }
 
 function seedExistingVoiceUsers() {
