@@ -1,9 +1,19 @@
 require("dotenv").config();
 
-const { Client, GatewayIntentBits, EmbedBuilder } = require("discord.js");
+const { Client, GatewayIntentBits, EmbedBuilder, ChannelType } = require("discord.js");
 const db = require("./database");
 const config = require("./config");
-const { formatDuration, formatDate, truncate } = require("./utils");
+const {
+    formatDuration,
+    formatShortDuration,
+    formatDate,
+    truncate,
+    getMadridDateKey,
+    levelFromXp,
+    getXpProgress,
+    makeProgressBar,
+    formatHours
+} = require("./utils");
 
 const client = new Client({
     intents: [
@@ -13,20 +23,56 @@ const client = new Client({
     ]
 });
 
-client.once("clientReady", () => {
+const VOICE_TICK_MS = 60 * 1000;
+const DAILY_CONNECTED_MINUTES = 60;
+const DAILY_MISSION_30_XP = 10;
+const DAILY_MISSION_60_XP = 25;
+const DAILY_STREAM_15_XP = 15;
+const DAILY_SOCIAL_30_XP = 15;
+
+client.once("clientReady", async () => {
     console.log(`Bot conectado como ${client.user.tag}`);
     console.log(`Servidores totales: ${client.guilds.cache.size}`);
 
     client.guilds.cache.forEach(guild => {
         console.log(`- ${guild.name} (${guild.id})`);
     });
+
+    seedExistingVoiceUsers();
+
+    for (const [, guild] of client.guilds.cache) {
+        await syncAllVoiceRoles(guild);
+    }
+
+    setInterval(async () => {
+        try {
+            for (const [, guild] of client.guilds.cache) {
+                await processGuildVoiceTick(guild);
+            }
+        } catch (error) {
+            console.error("Error en el tick de voz:", error);
+        }
+    }, VOICE_TICK_MS);
+});
+
+client.on("error", (error) => {
+    console.error("Error del cliente de Discord:", error);
+});
+
+process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled Rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+    console.error("Uncaught Exception:", error);
 });
 
 function saveName(userId, type, value) {
     if (!value) return;
 
     const exists = db.prepare(`
-        SELECT 1 FROM names
+        SELECT 1
+        FROM names
         WHERE user_id = ? AND type = ? AND value = ?
     `).get(userId, type, value);
 
@@ -40,7 +86,9 @@ function saveName(userId, type, value) {
 
 function ensureVoiceUserExists(userId) {
     const existing = db.prepare(`
-        SELECT * FROM voice_users WHERE user_id = ?
+        SELECT *
+        FROM voice_users
+        WHERE user_id = ?
     `).get(userId);
 
     if (!existing) {
@@ -48,13 +96,186 @@ function ensureVoiceUserExists(userId) {
             INSERT INTO voice_users (
                 user_id,
                 total_voice_time_ms,
+                total_stream_time_ms,
+                total_social_voice_time_ms,
                 voice_sessions_count,
                 first_voice_join_at,
                 last_voice_join_at,
-                last_voice_leave_at
-            ) VALUES (?, 0, 0, NULL, NULL, NULL)
+                last_voice_leave_at,
+                voice_xp,
+                voice_level,
+                days_connected,
+                xp_seeded
+            ) VALUES (?, 0, 0, 0, 0, NULL, NULL, NULL, 0, 0, 0, 1)
         `).run(userId);
     }
+}
+
+function seedExistingVoiceUsers() {
+    const rows = db.prepare(`
+        SELECT user_id, total_voice_time_ms, voice_xp, xp_seeded
+        FROM voice_users
+        WHERE xp_seeded = 0
+    `).all();
+
+    for (const row of rows) {
+        const seededXp = Math.max(row.voice_xp || 0, Math.floor((row.total_voice_time_ms || 0) / 60000));
+        const seededLevel = levelFromXp(seededXp);
+
+        db.prepare(`
+            UPDATE voice_users
+            SET voice_xp = ?, voice_level = ?, xp_seeded = 1
+            WHERE user_id = ?
+        `).run(seededXp, seededLevel, row.user_id);
+    }
+
+    if (rows.length > 0) {
+        console.log(`[VOICE XP] Seed aplicados a ${rows.length} usuarios con histórico previo`);
+    }
+}
+
+function isTrackableVoiceState(state) {
+    if (!state.channelId) return false;
+    if (state.guild.afkChannelId && state.channelId === state.guild.afkChannelId) return false;
+    return true;
+}
+
+function getOpenVoiceSession(userId) {
+    return db.prepare(`
+        SELECT *
+        FROM voice_sessions
+        WHERE user_id = ? AND left_at IS NULL
+        ORDER BY joined_at DESC
+        LIMIT 1
+    `).get(userId);
+}
+
+function ensureDailyRow(userId, dateKey) {
+    const row = db.prepare(`
+        SELECT *
+        FROM voice_daily_stats
+        WHERE user_id = ? AND stat_date = ?
+    `).get(userId, dateKey);
+
+    if (!row) {
+        db.prepare(`
+            INSERT INTO voice_daily_stats (
+                user_id,
+                stat_date,
+                voice_minutes,
+                stream_minutes,
+                social_minutes,
+                day_counted,
+                mission_30_done,
+                mission_60_done,
+                mission_stream_15_done,
+                mission_social_30_done
+            ) VALUES (?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
+        `).run(userId, dateKey);
+    }
+}
+
+async function getVoiceAnnounceChannel(guild) {
+    if (config.voiceAnnounceChannel) {
+        try {
+            const channel = await client.channels.fetch(config.voiceAnnounceChannel);
+            if (channel) return channel;
+        } catch (error) {
+            console.log("No se pudo obtener VOICE_ANNOUNCE_CHANNEL, se intentará por nombre.");
+        }
+    }
+
+    return guild.channels.cache.find(
+        channel =>
+            channel.type === ChannelType.GuildText &&
+            channel.name === "comandos-voz"
+    ) || null;
+}
+
+function getTargetVoiceRole(level) {
+    let targetRole = null;
+
+    for (const entry of config.voiceLevelRoles) {
+        if (level >= entry.level) {
+            targetRole = entry;
+        }
+    }
+
+    return targetRole;
+}
+
+async function syncVoiceLevelRole(guild, userId, level) {
+    if (!config.voiceLevelRoles || config.voiceLevelRoles.length === 0) return;
+
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (!member) return;
+
+    const configuredRoleIds = config.voiceLevelRoles.map(entry => entry.roleId);
+    const targetRole = getTargetVoiceRole(level);
+    const targetRoleId = targetRole ? targetRole.roleId : null;
+
+    const rolesToRemove = configuredRoleIds.filter(roleId =>
+        roleId !== targetRoleId && member.roles.cache.has(roleId)
+    );
+
+    if (rolesToRemove.length > 0) {
+        await member.roles.remove(rolesToRemove).catch(error => {
+            console.error(`No se pudieron quitar roles de voz a ${userId}:`, error);
+        });
+    }
+
+    if (targetRoleId && !member.roles.cache.has(targetRoleId)) {
+        await member.roles.add(targetRoleId).catch(error => {
+            console.error(`No se pudo añadir el rol de voz a ${userId}:`, error);
+        });
+    }
+}
+
+async function syncAllVoiceRoles(guild) {
+    if (!config.voiceLevelRoles || config.voiceLevelRoles.length === 0) return;
+
+    const rows = db.prepare(`
+        SELECT user_id, voice_level
+        FROM voice_users
+    `).all();
+
+    for (const row of rows) {
+        await syncVoiceLevelRole(guild, row.user_id, row.voice_level);
+    }
+
+    console.log(`[VOICE ROLES] Roles sincronizados en ${guild.name}`);
+}
+
+async function announceLevelUp(guild, userId, oldLevel, newLevel) {
+    const channel = await getVoiceAnnounceChannel(guild);
+    if (!channel) return;
+
+    const targetRole = getTargetVoiceRole(newLevel);
+
+    let roleText = "";
+    if (targetRole) {
+        roleText = `\n🏅 Nuevo rango: <@&${targetRole.roleId}>`;
+    }
+
+    await channel.send(
+        `🎉 <@${userId}> ha subido de **nivel de voz ${oldLevel}** a **nivel ${newLevel}**${roleText}`
+    );
+}
+
+function getChannelHumanCount(member) {
+    const channel = member.voice?.channel;
+    if (!channel) return 0;
+
+    return channel.members.filter(m => !m.user.bot).size;
+}
+
+function getMinuteXp(member) {
+    const count = getChannelHumanCount(member);
+
+    if (count <= 1) return 0;
+    if (count === 2) return 1;
+    if (count <= 4) return 2;
+    return 3;
 }
 
 function openVoiceSession(member, channelId) {
@@ -63,24 +284,29 @@ function openVoiceSession(member, channelId) {
 
     ensureVoiceUserExists(userId);
 
-    const openSession = db.prepare(`
-        SELECT * FROM voice_sessions
-        WHERE user_id = ? AND left_at IS NULL
-        ORDER BY joined_at DESC
-        LIMIT 1
-    `).get(userId);
-
-    if (openSession) {
-        return;
-    }
+    const openSession = getOpenVoiceSession(userId);
+    if (openSession) return;
 
     db.prepare(`
-        INSERT INTO voice_sessions (user_id, guild_id, channel_id, joined_at)
-        VALUES (?, ?, ?, ?)
-    `).run(userId, member.guild.id, channelId, now);
+        INSERT INTO voice_sessions (
+            user_id,
+            guild_id,
+            channel_id,
+            joined_at,
+            left_at,
+            duration_ms,
+            tracked_voice_ms,
+            tracked_stream_ms,
+            tracked_social_voice_ms,
+            xp_earned,
+            last_tick_at
+        ) VALUES (?, ?, ?, ?, NULL, 0, 0, 0, 0, 0, ?)
+    `).run(userId, member.guild.id, channelId, now, now);
 
     const voiceUser = db.prepare(`
-        SELECT * FROM voice_users WHERE user_id = ?
+        SELECT *
+        FROM voice_users
+        WHERE user_id = ?
     `).get(userId);
 
     if (!voiceUser.first_voice_join_at) {
@@ -100,66 +326,234 @@ function openVoiceSession(member, channelId) {
     console.log(`[VOICE] ${member.user.tag} entró a voz en canal ${channelId}`);
 }
 
-function closeVoiceSession(member, reason = "leave") {
-    const now = new Date().toISOString();
-    const userId = member.id;
+async function applyVoiceProgress(member, nowDate = new Date()) {
+    if (!member || member.user.bot) return;
+    if (!member.voice?.channelId) return;
+    if (member.guild.afkChannelId && member.voice.channelId === member.guild.afkChannelId) return;
 
-    const openSession = db.prepare(`
-        SELECT * FROM voice_sessions
-        WHERE user_id = ? AND left_at IS NULL
-        ORDER BY joined_at DESC
-        LIMIT 1
-    `).get(userId);
+    ensureVoiceUserExists(member.id);
 
-    if (!openSession) {
-        return null;
+    let session = getOpenVoiceSession(member.id);
+    if (!session) {
+        openVoiceSession(member, member.voice.channelId);
+        session = getOpenVoiceSession(member.id);
+        if (!session) return;
     }
 
-    const joinedAt = new Date(openSession.joined_at);
-    const leftAt = new Date(now);
-    const durationMs = Math.max(0, leftAt - joinedAt);
+    const lastTick = new Date(session.last_tick_at || session.joined_at);
+    const diffMs = nowDate - lastTick;
+    const fullMinutes = Math.floor(diffMs / 60000);
+
+    if (fullMinutes <= 0) return;
+
+    let baseXp = 0;
+    let bonusXp = 0;
+    let daysGained = 0;
+    let streamMinutesAwarded = 0;
+    let socialMinutesAwarded = 0;
+
+    for (let i = 1; i <= fullMinutes; i++) {
+        const minuteMark = new Date(lastTick.getTime() + (i * 60000));
+        const dateKey = getMadridDateKey(minuteMark);
+        ensureDailyRow(member.id, dateKey);
+
+        const daily = db.prepare(`
+            SELECT *
+            FROM voice_daily_stats
+            WHERE user_id = ? AND stat_date = ?
+        `).get(member.id, dateKey);
+
+        const minuteXp = getMinuteXp(member);
+        const isStreaming = Boolean(member.voice.selfStream);
+        const isSocialMinute = minuteXp > 0;
+
+        const nextVoiceMinutes = daily.voice_minutes + 1;
+        const nextStreamMinutes = daily.stream_minutes + (isStreaming ? 1 : 0);
+        const nextSocialMinutes = daily.social_minutes + (isSocialMinute ? 1 : 0);
+
+        let mission30Done = daily.mission_30_done;
+        let mission60Done = daily.mission_60_done;
+        let missionStream15Done = daily.mission_stream_15_done;
+        let missionSocial30Done = daily.mission_social_30_done;
+        let dayCounted = daily.day_counted;
+
+        baseXp += minuteXp;
+
+        if (isStreaming) {
+            streamMinutesAwarded += 1;
+            baseXp += 1;
+        }
+
+        if (isSocialMinute) {
+            socialMinutesAwarded += 1;
+        }
+
+        if (!mission30Done && nextVoiceMinutes >= 30) {
+            bonusXp += DAILY_MISSION_30_XP;
+            mission30Done = 1;
+        }
+
+        if (!mission60Done && nextVoiceMinutes >= DAILY_CONNECTED_MINUTES) {
+            bonusXp += DAILY_MISSION_60_XP;
+            mission60Done = 1;
+        }
+
+        if (!dayCounted && nextVoiceMinutes >= DAILY_CONNECTED_MINUTES) {
+            dayCounted = 1;
+            daysGained += 1;
+        }
+
+        if (!missionStream15Done && nextStreamMinutes >= 15) {
+            bonusXp += DAILY_STREAM_15_XP;
+            missionStream15Done = 1;
+        }
+
+        if (!missionSocial30Done && nextSocialMinutes >= 30) {
+            bonusXp += DAILY_SOCIAL_30_XP;
+            missionSocial30Done = 1;
+        }
+
+        db.prepare(`
+            UPDATE voice_daily_stats
+            SET
+                voice_minutes = ?,
+                stream_minutes = ?,
+                social_minutes = ?,
+                day_counted = ?,
+                mission_30_done = ?,
+                mission_60_done = ?,
+                mission_stream_15_done = ?,
+                mission_social_30_done = ?
+            WHERE user_id = ? AND stat_date = ?
+        `).run(
+            nextVoiceMinutes,
+            nextStreamMinutes,
+            nextSocialMinutes,
+            dayCounted,
+            mission30Done,
+            mission60Done,
+            missionStream15Done,
+            missionSocial30Done,
+            member.id,
+            dateKey
+        );
+    }
+
+    const awardVoiceMs = fullMinutes * 60000;
+    const awardStreamMs = streamMinutesAwarded * 60000;
+    const awardSocialMs = socialMinutesAwarded * 60000;
+    const totalXpGain = baseXp + bonusXp;
+    const newLastTick = new Date(lastTick.getTime() + (fullMinutes * 60000)).toISOString();
+
+    const voiceUserBefore = db.prepare(`
+        SELECT *
+        FROM voice_users
+        WHERE user_id = ?
+    `).get(member.id);
+
+    const newXp = (voiceUserBefore.voice_xp || 0) + totalXpGain;
+    const oldLevel = voiceUserBefore.voice_level || 0;
+    const newLevel = levelFromXp(newXp);
 
     db.prepare(`
         UPDATE voice_sessions
-        SET left_at = ?, duration_ms = ?
+        SET
+            tracked_voice_ms = tracked_voice_ms + ?,
+            tracked_stream_ms = tracked_stream_ms + ?,
+            tracked_social_voice_ms = tracked_social_voice_ms + ?,
+            xp_earned = xp_earned + ?,
+            last_tick_at = ?
         WHERE id = ?
-    `).run(now, durationMs, openSession.id);
-
-    ensureVoiceUserExists(userId);
+    `).run(
+        awardVoiceMs,
+        awardStreamMs,
+        awardSocialMs,
+        totalXpGain,
+        newLastTick,
+        session.id
+    );
 
     db.prepare(`
         UPDATE voice_users
         SET
             total_voice_time_ms = total_voice_time_ms + ?,
+            total_stream_time_ms = total_stream_time_ms + ?,
+            total_social_voice_time_ms = total_social_voice_time_ms + ?,
+            voice_xp = ?,
+            voice_level = ?,
+            days_connected = days_connected + ?
+        WHERE user_id = ?
+    `).run(
+        awardVoiceMs,
+        awardStreamMs,
+        awardSocialMs,
+        newXp,
+        newLevel,
+        daysGained,
+        member.id
+    );
+
+    if (newLevel > oldLevel) {
+        await syncVoiceLevelRole(member.guild, member.id, newLevel);
+        await announceLevelUp(member.guild, member.id, oldLevel, newLevel);
+    }
+}
+
+async function closeVoiceSession(member, reason = "leave") {
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const userId = member.id;
+
+    await applyVoiceProgress(member, now);
+
+    const session = getOpenVoiceSession(userId);
+    if (!session) return null;
+
+    const joinedAt = new Date(session.joined_at);
+    const actualDurationMs = Math.max(0, now - joinedAt);
+
+    db.prepare(`
+        UPDATE voice_sessions
+        SET
+            left_at = ?,
+            duration_ms = ?,
+            last_tick_at = ?
+        WHERE id = ?
+    `).run(
+        nowIso,
+        actualDurationMs,
+        nowIso,
+        session.id
+    );
+
+    db.prepare(`
+        UPDATE voice_users
+        SET
             voice_sessions_count = voice_sessions_count + 1,
             last_voice_leave_at = ?
         WHERE user_id = ?
-    `).run(durationMs, now, userId);
+    `).run(nowIso, userId);
 
-    console.log(`[VOICE] ${member.user.tag} salió de voz (${reason}) tras ${formatDuration(durationMs)}`);
+    console.log(`[VOICE] ${member.user.tag} salió de voz (${reason}) tras ${formatDuration(actualDurationMs)}`);
 
     return {
-        durationMs,
-        channelId: openSession.channel_id,
-        joinedAt: openSession.joined_at,
-        leftAt: now
+        durationMs: actualDurationMs,
+        channelId: session.channel_id,
+        joinedAt: session.joined_at,
+        leftAt: nowIso
     };
 }
 
-function buildVoiceLevel(totalVoiceMs) {
-    const hours = totalVoiceMs / (1000 * 60 * 60);
+async function processGuildVoiceTick(guild) {
+    const states = guild.voiceStates.cache;
 
-    if (hours < 1) return 0;
-    if (hours < 3) return 1;
-    if (hours < 6) return 2;
-    if (hours < 10) return 3;
-    if (hours < 20) return 4;
-    if (hours < 35) return 5;
-    if (hours < 50) return 6;
-    if (hours < 75) return 7;
-    if (hours < 100) return 8;
-    if (hours < 150) return 9;
-    return 10;
+    for (const [, state] of states) {
+        const member = state.member;
+        if (!member || member.user.bot) continue;
+        if (!isTrackableVoiceState(state)) continue;
+
+        await applyVoiceProgress(member, new Date());
+    }
 }
 
 client.on("guildMemberAdd", async (member) => {
@@ -167,7 +561,9 @@ client.on("guildMemberAdd", async (member) => {
     const userId = member.id;
 
     const existing = db.prepare(`
-        SELECT * FROM users WHERE user_id = ?
+        SELECT *
+        FROM users
+        WHERE user_id = ?
     `).get(userId);
 
     if (!existing) {
@@ -201,9 +597,7 @@ client.on("guildMemberAdd", async (member) => {
 
     const avisosChannel = await client.channels.fetch(config.avisosChannel);
     if (avisosChannel) {
-        await avisosChannel.send(
-            `📥 **Entrada registrada**\nUsuario: ${member.user.tag}\nID: ${userId}`
-        );
+        await avisosChannel.send(`📥 **Entrada registrada**\nUsuario: ${member.user.tag}\nID: ${userId}`);
     }
 });
 
@@ -211,10 +605,11 @@ client.on("guildMemberRemove", async (member) => {
     const now = new Date().toISOString();
     const userId = member.id;
 
-    closeVoiceSession(member, "guild_leave");
+    await closeVoiceSession(member, "guild_leave");
 
     const session = db.prepare(`
-        SELECT * FROM sessions
+        SELECT *
+        FROM sessions
         WHERE user_id = ? AND left_at IS NULL
         ORDER BY joined_at DESC
         LIMIT 1
@@ -245,7 +640,9 @@ client.on("guildMemberRemove", async (member) => {
     `).run(now, duration, userId);
 
     const user = db.prepare(`
-        SELECT * FROM users WHERE user_id = ?
+        SELECT *
+        FROM users
+        WHERE user_id = ?
     `).get(userId);
 
     const despedidasChannel = await client.channels.fetch(config.despedidasChannel);
@@ -270,7 +667,8 @@ client.on("guildMemberRemove", async (member) => {
     }
 
     const names = db.prepare(`
-        SELECT type, value FROM names
+        SELECT type, value
+        FROM names
         WHERE user_id = ?
         ORDER BY seen_at ASC
     `).all(userId);
@@ -321,22 +719,22 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         const member = newState.member || oldState.member;
         if (!member || member.user.bot) return;
 
-        const oldChannelId = oldState.channelId;
-        const newChannelId = newState.channelId;
+        const wasTrackable = isTrackableVoiceState(oldState);
+        const isNowTrackable = isTrackableVoiceState(newState);
 
-        if (!oldChannelId && newChannelId) {
-            openVoiceSession(member, newChannelId);
+        if (!wasTrackable && isNowTrackable) {
+            openVoiceSession(member, newState.channelId);
             return;
         }
 
-        if (oldChannelId && !newChannelId) {
-            closeVoiceSession(member, "disconnect");
+        if (wasTrackable && !isNowTrackable) {
+            await closeVoiceSession(member, "disconnect_or_afk");
             return;
         }
 
-        if (oldChannelId && newChannelId && oldChannelId !== newChannelId) {
-            closeVoiceSession(member, "switch_channel");
-            openVoiceSession(member, newChannelId);
+        if (wasTrackable && isNowTrackable && oldState.channelId !== newState.channelId) {
+            await closeVoiceSession(member, "switch_channel");
+            openVoiceSession(member, newState.channelId);
         }
     } catch (error) {
         console.error("Error en voiceStateUpdate:", error);
@@ -347,19 +745,21 @@ client.on("interactionCreate", async (interaction) => {
     try {
         if (!interaction.isChatInputCommand()) return;
 
+        await interaction.deferReply();
+
         const command = interaction.commandName;
 
         if (command === "voz-top-tiempo") {
             const rows = db.prepare(`
-                SELECT user_id, total_voice_time_ms
+                SELECT user_id, total_voice_time_ms, voice_level
                 FROM voice_users
-                ORDER BY total_voice_time_ms DESC
+                ORDER BY total_voice_time_ms DESC, voice_xp DESC
                 LIMIT 10
             `).all();
 
             const description = rows.length
                 ? rows.map((row, index) =>
-                    `**${index + 1}.** <@${row.user_id}> — ${formatDuration(row.total_voice_time_ms)}`
+                    `**${index + 1}.** <@${row.user_id}> — ${formatShortDuration(row.total_voice_time_ms)} · Nivel ${row.voice_level}`
                 ).join("\n")
                 : "No hay datos de voz todavía.";
 
@@ -369,30 +769,30 @@ client.on("interactionCreate", async (interaction) => {
                 .setColor(0x5865f2)
                 .setTimestamp();
 
-            return interaction.reply({ embeds: [embed] });
+            return interaction.editReply({ embeds: [embed] });
         }
 
-        if (command === "voz-top-uniones") {
+        if (command === "voz-top-dias") {
             const rows = db.prepare(`
-                SELECT user_id, voice_sessions_count, total_voice_time_ms
+                SELECT user_id, days_connected, voice_level, total_voice_time_ms
                 FROM voice_users
-                ORDER BY voice_sessions_count DESC, total_voice_time_ms DESC
+                ORDER BY days_connected DESC, total_voice_time_ms DESC
                 LIMIT 10
             `).all();
 
             const description = rows.length
                 ? rows.map((row, index) =>
-                    `**${index + 1}.** <@${row.user_id}> — ${row.voice_sessions_count} sesiones`
+                    `**${index + 1}.** <@${row.user_id}> — ${row.days_connected} días · Nivel ${row.voice_level}`
                 ).join("\n")
-                : "No hay datos de voz todavía.";
+                : "No hay días conectados registrados todavía.";
 
             const embed = new EmbedBuilder()
-                .setTitle("🔁 Top uniones a voz")
+                .setTitle("📅 Top días conectados")
                 .setDescription(description)
                 .setColor(0x57f287)
                 .setTimestamp();
 
-            return interaction.reply({ embeds: [embed] });
+            return interaction.editReply({ embeds: [embed] });
         }
 
         if (command === "voz-perfil") {
@@ -405,9 +805,8 @@ client.on("interactionCreate", async (interaction) => {
             `).get(targetUser.id);
 
             if (!row) {
-                return interaction.reply({
-                    content: "Este usuario todavía no tiene actividad de voz registrada.",
-                    ephemeral: true
+                return interaction.editReply({
+                    content: "Este usuario todavía no tiene actividad de voz registrada."
                 });
             }
 
@@ -415,40 +814,125 @@ client.on("interactionCreate", async (interaction) => {
                 ? Math.floor(row.total_voice_time_ms / row.voice_sessions_count)
                 : 0;
 
-            const voiceLevel = buildVoiceLevel(row.total_voice_time_ms);
+            const progress = getXpProgress(row.voice_xp);
+            const currentRole = getTargetVoiceRole(row.voice_level);
+            const currentRoleText = currentRole ? `<@&${currentRole.roleId}>` : "Sin rango de voz";
+
+            const description = [
+                `**<@${targetUser.id}>**`,
+                `Actividad y progreso actual en voz`,
+                ``,
+                `⭐ **Nivel:** ${row.voice_level}`,
+                `✨ **XP:** ${row.voice_xp}`,
+                `🏅 **Rango actual:** ${currentRoleText}`,
+                `📅 **Días conectados:** ${row.days_connected}`,
+                ``,
+                `⏳ **Tiempo total en voz**`,
+                `${formatDuration(row.total_voice_time_ms)}`,
+                ``,
+                `🤝 **Tiempo acompañado**`,
+                `${formatDuration(row.total_social_voice_time_ms)}`,
+                ``,
+                `🖥️ **Tiempo compartiendo pantalla**`,
+                `${formatDuration(row.total_stream_time_ms)}`,
+                ``,
+                `🎙️ **Sesiones completadas**`,
+                `${row.voice_sessions_count}`,
+                ``,
+                `📊 **Media por sesión**`,
+                `${formatDuration(avgSessionMs)}`,
+                ``,
+                `📈 **Progreso al siguiente nivel**`,
+                `${makeProgressBar(progress.percent)} ${progress.percent}%`,
+                ``,
+                `🚀 **Siguiente nivel**`,
+                `Nivel ${row.voice_level + 1} · ${progress.remaining} XP restantes`,
+                ``,
+                `🎙️ **Primera vez en voz**`,
+                `${formatDate(row.first_voice_join_at)}`,
+                ``,
+                `🔴 **Última salida**`,
+                `${formatDate(row.last_voice_leave_at)}`
+            ].join("\n");
 
             const embed = new EmbedBuilder()
-                .setTitle("🎧 Perfil de voz")
+                .setTitle("🎧 Tarjeta de voz")
                 .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
-                .addFields(
-                    { name: "Usuario", value: `<@${targetUser.id}>`, inline: true },
-                    { name: "⭐ Nivel de voz", value: `${voiceLevel}`, inline: true },
-                    { name: "⏳ Tiempo total", value: formatDuration(row.total_voice_time_ms), inline: true },
-                    { name: "🔁 Sesiones", value: `${row.voice_sessions_count}`, inline: true },
-                    { name: "📊 Media por sesión", value: formatDuration(avgSessionMs), inline: true },
-                    { name: "🎙️ Primera vez en voz", value: formatDate(row.first_voice_join_at), inline: false },
-                    { name: "🟢 Última entrada a voz", value: formatDate(row.last_voice_join_at), inline: true },
-                    { name: "🔴 Última salida de voz", value: formatDate(row.last_voice_leave_at), inline: true }
-                )
+                .setDescription(description)
                 .setColor(0xfee75c)
+                .setFooter({ text: "Sistema de actividad en voz" })
                 .setTimestamp();
 
-            return interaction.reply({ embeds: [embed] });
+            return interaction.editReply({ embeds: [embed] });
         }
+
+        if (command === "voz-nivel") {
+            const targetUser = interaction.options.getUser("usuario") || interaction.user;
+
+            const row = db.prepare(`
+                SELECT *
+                FROM voice_users
+                WHERE user_id = ?
+            `).get(targetUser.id);
+
+            if (!row) {
+                return interaction.editReply({
+                    content: "Este usuario todavía no tiene actividad de voz registrada."
+                });
+            }
+
+            const progress = getXpProgress(row.voice_xp);
+            const currentRole = getTargetVoiceRole(row.voice_level);
+            const currentRoleText = currentRole ? `<@&${currentRole.roleId}>` : "Sin rango";
+
+            const description = [
+                `**<@${targetUser.id}>**`,
+                `Progreso actual del sistema de experiencia en voz`,
+                ``,
+                `⭐ **Nivel actual:** ${row.voice_level}`,
+                `✨ **XP actual:** ${row.voice_xp}`,
+                `🧩 **XP restante:** ${progress.remaining}`,
+                `🏅 **Rango:** ${currentRoleText}`,
+                ``,
+                `📈 **Progreso**`,
+                `${makeProgressBar(progress.percent)} ${progress.percent}%`,
+                ``,
+                `🚀 **Próximo nivel**`,
+                `Nivel ${row.voice_level + 1}`,
+                ``,
+                `⏳ **Tiempo aproximado restante**`,
+                `${formatHours(progress.remaining / 60)}`
+            ].join("\n");
+
+            const embed = new EmbedBuilder()
+                .setTitle("⭐ Nivel de voz")
+                .setThumbnail(targetUser.displayAvatarURL({ dynamic: true }))
+                .setDescription(description)
+                .setColor(0xf1c40f)
+                .setFooter({ text: "XP social: solo cuenta bien si no estás solo en voz" })
+                .setTimestamp();
+
+            return interaction.editReply({ embeds: [embed] });
+        }
+
+        return interaction.editReply({ content: "Comando no reconocido." });
     } catch (error) {
         console.error("Error en interactionCreate:", error);
 
-        if (interaction.deferred || interaction.replied) {
-            return interaction.followUp({
-                content: "Ha ocurrido un error ejecutando el comando.",
-                ephemeral: true
-            });
+        try {
+            if (interaction.deferred || interaction.replied) {
+                await interaction.editReply({
+                    content: "Ha ocurrido un error ejecutando el comando."
+                });
+            } else {
+                await interaction.reply({
+                    content: "Ha ocurrido un error ejecutando el comando.",
+                    ephemeral: true
+                });
+            }
+        } catch (replyError) {
+            console.error("Error respondiendo al fallo del comando:", replyError);
         }
-
-        return interaction.reply({
-            content: "Ha ocurrido un error ejecutando el comando.",
-            ephemeral: true
-        });
     }
 });
 
