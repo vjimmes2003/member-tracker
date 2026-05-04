@@ -383,7 +383,7 @@ async function applyVoiceProgress(member, nowDate = new Date()) {
         `).get(member.id, dateKey);
 
         const minuteXp = getMinuteXp(member);
-        const isStreaming = Boolean(member.voice.selfStream);
+        const isStreaming = Boolean(member.voice.streaming);
         const isSocialMinute = minuteXp > 0;
 
         const nextVoiceMinutes = daily.voice_minutes + 1;
@@ -766,6 +766,19 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 
         if (wasTrackable && !isNowTrackable) {
             await closeVoiceSession(member, "disconnect_or_afk");
+            return;
+        }
+
+        const wasStreaming = Boolean(oldState.streaming);
+        const isStreaming = Boolean(newState.streaming);
+
+        if (wasTrackable && isNowTrackable && wasStreaming !== isStreaming) {
+            await applyVoiceProgress(member, new Date());
+
+            console.log(
+                `[VOICE STREAM] ${member.user.tag} ${isStreaming ? "empezó a compartir pantalla" : "dejó de compartir pantalla"}`
+            );
+
             return;
         }
 
